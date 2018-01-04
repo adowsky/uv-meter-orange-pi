@@ -1,6 +1,5 @@
 import numpy as np
 import glob
-import struct
 import pyaudio
 import wave
 import time
@@ -16,7 +15,6 @@ CHUNK_SIZE = 2048
 FFT_SIZE = 200
 MAX_SHORT = 32768
 WINDOW = window_fun(CHUNK_SIZE)
-time_iter = []
 Chunk = namedtuple("Chunk", ["raw_data", "processed_data"])
 
 
@@ -30,20 +28,23 @@ class Player:
         self._play_lock = threading.Lock()
         self._add_lock = threading.Lock()
         self._play_lock.acquire()
-        self._stream.start_stream()
         self._buffer = []
+        self._is_playing = False
         self._finish = False
 
     def callback(self, in_data, frame_count, time_info, status):
         data = self._get_next_chunk()
         self._processed_data_handler(data.processed_data)
-        status = pyaudio.paComplete if self._finish else pyaudio.paContinue
+        status = pyaudio.paContinue
         return data.raw_data, status
 
     def _get_next_chunk(self):
         self._add_lock.acquire()
         try:
-            chunk = self._buffer.pop(0) if len(self._buffer) > 0 else Chunk("", None)
+            if not self._is_playing:
+                chunk = Chunk(np.zeros(CHUNK_SIZE).data, None)
+            else:
+                chunk = self._buffer.pop(0) if len(self._buffer) > 0 else Chunk(np.zeros(CHUNK_SIZE).data, None)
         finally:
             self._add_lock.release()
         return chunk
@@ -64,6 +65,10 @@ class Player:
     def wait_for_finish(self):
         while self._stream.is_active():
             time.sleep(0.1)
+
+    def play(self):
+        self._is_playing = True
+        self._stream.start_stream()
 
 
 def reduce_to_single_channel_avg(chunk, channels):
@@ -86,6 +91,9 @@ class Song:
         self._elapsed_frames += size_to_get
         return size_to_get, self._wave_file.readframes(size_to_get)
 
+    def get_remaining_frames_count(self):
+        return self.song_length_frames - self._elapsed_frames
+
     def max_freq_value(self, freq, spectrum):
         val = -MAX_SHORT
         for i in range(self.find_freq_best_fit_idx(freq[0]),
@@ -103,14 +111,14 @@ class Song:
                 best_difference = current_difference
         return best_idx
 
+    def print_frames_status(self):
+        print ("Read ", self._elapsed_frames, "of ", self.song_length_frames, "frames")
+
 
 def compute_spectrum(frames, channels_count):
-    start = time.time()
-    channel_reduced_chunk = reduce_to_single_channel_avg(frames, channels_count)
-    time_iter.append(time.time() - start)
-
+    channel_reduced_chunk = frames[::channels_count]
     window = WINDOW if len(WINDOW) == len(channel_reduced_chunk) else window_fun(len(channel_reduced_chunk))
-    channel_reduced_chunk *= window
+    np.multiply(channel_reduced_chunk, window, out=channel_reduced_chunk, casting="unsafe")
     spectrum = np.fft.rfft(channel_reduced_chunk, FFT_SIZE) * 2 / len(channel_reduced_chunk)
     return np.abs(spectrum)
 
@@ -118,18 +126,16 @@ def compute_spectrum(frames, channels_count):
 def handle_measured_frequency_buckets(values):
     # todo leds imlementation
     # every value is in range [0, MAX_SHORT)
-    if values is not None and len(values) == 3:
-
-        val = int(values[0]) / int((MAX_SHORT / 3))
-        print("bass=%f mid=%f treble=%f " % (
-            values[0], values[1], values[2],))
+    pass
 
 
 def play(filename):
+    print ("Playing song file=" + filename)
     song = Song(filename)
     player = Player(song.samplewidth, song.channels_count, song.rate, 2, handle_measured_frequency_buckets)
-
+    player.play()
     chunk_length, data = song.get_next_chunk()
+
     while len(data) > 0:
         frames = np.fromstring(data, dtype=np.ushort)
         spectrum = compute_spectrum(frames, song.channels_count)
@@ -139,9 +145,8 @@ def play(filename):
             song.max_freq_value(freq=(5010, 12000), spectrum=spectrum)
         ]
         player.add_chunk(Chunk(raw_data=data, processed_data=sound_measures))
-        # todo for debug
-        # print("bass=%f mid=%f treble=%f max=%f" % (sound_measures[0], sound_measures[1], sound_measures[2], spectrum.max() / MAX_SHORT))
         chunk_length, data = song.get_next_chunk()
+    print("Waiting for last chunk")
     player.wait_for_finish()
     player.shutdown()
     print("Fin.")
@@ -158,4 +163,3 @@ if __name__ == "__main__":
     for sound_file in sound_files:
         play(sound_file)
 
-    print np.mean(time_iter)
